@@ -1,17 +1,20 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AlphaSiftHotspotRefreshTaskStatus } from '../../api/alphasift';
 import StockScreeningPage from '../StockScreeningPage';
 
 const {
   enableAlphaSift,
   getAlphaSiftStatus,
   getHotspotDetail,
+  getHotspotRefreshTask,
   getHotspots,
   getStrategies,
   getScreenTask,
   navigate,
   resetLastScreenResult,
   screenStocks,
+  startHotspotRefreshTask,
   startScreenTask,
 } = vi.hoisted(() => {
   let lastScreenResult: unknown = null;
@@ -39,10 +42,44 @@ const {
       result: lastScreenResult,
     };
   });
+  const startHotspotRefreshTask = vi.fn(async (payload: unknown) => {
+    void payload;
+    return {
+      taskId: 'hotspot-refresh-1',
+      traceId: 'hotspot-refresh-1',
+      status: 'pending',
+      message: '热点题材后台刷新任务已提交',
+      reused: false,
+      provider: 'akshare',
+      top: 12,
+    };
+  });
+  const getHotspotRefreshTask = vi.fn(async (taskId: string): Promise<AlphaSiftHotspotRefreshTaskStatus> => {
+    void taskId;
+    return {
+      taskId: 'hotspot-refresh-1',
+      traceId: 'hotspot-refresh-1',
+      status: 'completed',
+      progress: 100,
+      message: '任务执行完成',
+      result: {
+        hotspotCount: 12,
+        cachedAt: '2026-07-22T08:55:15Z',
+        fallbackUsed: false,
+        sourceErrors: [],
+      } as {
+        hotspotCount: number;
+        cachedAt?: string | null;
+        fallbackUsed?: boolean;
+        sourceErrors?: string[];
+      } | null,
+    };
+  });
   return {
     enableAlphaSift: vi.fn(),
     getAlphaSiftStatus: vi.fn(),
     getHotspotDetail: vi.fn(),
+    getHotspotRefreshTask,
     getHotspots: vi.fn(),
     getStrategies: vi.fn(),
     getScreenTask,
@@ -51,6 +88,7 @@ const {
       lastScreenResult = null;
     },
     screenStocks,
+    startHotspotRefreshTask,
     startScreenTask,
   };
 });
@@ -68,10 +106,12 @@ vi.mock('../../api/alphasift', () => ({
     enable: () => enableAlphaSift(),
     getStatus: () => getAlphaSiftStatus(),
     getHotspotDetail: (payload: unknown) => getHotspotDetail(payload),
+    getHotspotRefreshTask: (taskId: string) => getHotspotRefreshTask(taskId),
     getHotspots: (payload: unknown) => getHotspots(payload),
     getStrategies: () => getStrategies(),
     getScreenTask: (taskId: string) => getScreenTask(taskId),
     screen: (payload: unknown) => screenStocks(payload),
+    startHotspotRefresh: (payload: unknown) => startHotspotRefreshTask(payload),
     startScreen: (payload: unknown) => startScreenTask(payload),
   },
 }));
@@ -108,12 +148,14 @@ describe('StockScreeningPage', () => {
     enableAlphaSift.mockReset();
     getAlphaSiftStatus.mockReset();
     getHotspotDetail.mockReset();
+    getHotspotRefreshTask.mockClear();
     getHotspots.mockReset();
     getStrategies.mockReset();
     getScreenTask.mockClear();
     navigate.mockReset();
     resetLastScreenResult();
     screenStocks.mockReset();
+    startHotspotRefreshTask.mockClear();
     startScreenTask.mockClear();
     getStrategies.mockResolvedValue(mockStrategiesResponse);
     getHotspotDetail.mockResolvedValue({
@@ -217,7 +259,11 @@ describe('StockScreeningPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /展开热点题材/ }));
     fireEvent.click(screen.getByRole('button', { name: /刷新热点题材/ }));
 
-    await waitFor(() => expect(getHotspots).toHaveBeenCalledWith({ provider: 'akshare', top: 12, refresh: true }));
+    await waitFor(() => expect(startHotspotRefreshTask).toHaveBeenCalledWith({ provider: 'akshare', top: 12 }));
+    await waitFor(() => expect(getHotspotRefreshTask).toHaveBeenCalledWith('hotspot-refresh-1'));
+    await waitFor(() => expect(getHotspots).toHaveBeenCalledTimes(2));
+    expect(getHotspots).toHaveBeenLastCalledWith({ provider: 'akshare', top: 12, refresh: false });
+    expect(await screen.findByText(/热点题材后台刷新完成/)).toBeInTheDocument();
     fireEvent.click(await screen.findByRole('button', { name: /AI算力/ }));
     await waitFor(() => expect(getHotspotDetail).toHaveBeenCalledWith({ topic: 'AI算力', provider: 'akshare', refresh: false }));
     await waitFor(() => expect(screen.getAllByText('AI算力').length).toBeGreaterThan(0));
@@ -576,7 +622,7 @@ describe('StockScreeningPage', () => {
     expect(screen.queryByText('中际旭创')).not.toBeInTheDocument();
   });
 
-  it('reloads selected hotspot detail when refreshed themes keep the same topic', async () => {
+  it('keeps selected hotspot detail lazy-loaded after background theme refresh', async () => {
     getAlphaSiftStatus.mockResolvedValueOnce({
       enabled: true,
       available: true,
@@ -648,11 +694,12 @@ describe('StockScreeningPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /刷新热点题材/ }));
 
-    await waitFor(() => expect(getHotspots).toHaveBeenCalledWith({ provider: 'akshare', top: 12, refresh: true }));
-    await waitFor(() => expect(getHotspotDetail).toHaveBeenCalledTimes(2));
-    expect(getHotspotDetail).toHaveBeenLastCalledWith({ topic: 'AI算力', provider: 'akshare', refresh: true });
-    expect(await screen.findByText('刷新发酵')).toBeInTheDocument();
-    expect(screen.getByText('工业富联')).toBeInTheDocument();
+    await waitFor(() => expect(startHotspotRefreshTask).toHaveBeenCalledWith({ provider: 'akshare', top: 12 }));
+    await waitFor(() => expect(getHotspots).toHaveBeenCalledTimes(2));
+    expect(getHotspots).toHaveBeenLastCalledWith({ provider: 'akshare', top: 12, refresh: false });
+    expect(getHotspotDetail).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText('盘中发酵')).toBeInTheDocument();
+    expect(screen.getByText('中际旭创')).toBeInTheDocument();
   });
 
   it('keeps existing hotspot cards when manual refresh fails', async () => {
@@ -680,8 +727,16 @@ describe('StockScreeningPage', () => {
           },
         ],
         hotspotCount: 1,
-      })
-      .mockRejectedValueOnce(new Error('manual refresh failed'));
+      });
+    getHotspotRefreshTask.mockResolvedValueOnce({
+      taskId: 'hotspot-refresh-1',
+      traceId: 'hotspot-refresh-1',
+      status: 'failed',
+      progress: 100,
+      message: '热点刷新失败',
+      error: 'manual refresh failed',
+      result: null,
+    });
 
     render(<StockScreeningPage />);
 
@@ -692,11 +747,49 @@ describe('StockScreeningPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /刷新热点题材/ }));
 
-    await waitFor(() => expect(getHotspots).toHaveBeenCalledWith({ provider: 'akshare', top: 12, refresh: true }));
+    await waitFor(() => expect(startHotspotRefreshTask).toHaveBeenCalledWith({ provider: 'akshare', top: 12 }));
+    await waitFor(() => expect(getHotspotRefreshTask).toHaveBeenCalledWith('hotspot-refresh-1'));
     expect(await screen.findByText(/manual refresh failed/)).toBeInTheDocument();
     expect(screen.getByText('强势领先')).toBeInTheDocument();
     expect(screen.getByText(/中际旭创、工业富联/)).toBeInTheDocument();
     expect(screen.queryByText(/点击刷新后会拉取热点概念/)).not.toBeInTheDocument();
+  });
+
+  it('keeps existing hotspot cards when status polling temporarily fails', async () => {
+    getAlphaSiftStatus.mockResolvedValueOnce({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    getHotspots.mockResolvedValueOnce({
+      enabled: true,
+      provider: 'akshare',
+      providerUsed: 'akshare',
+      hotspots: [
+        {
+          topic: 'AI算力',
+          name: 'AI算力',
+          heatScore: 88,
+          stage: '加速主升',
+          leaders: ['中际旭创'],
+        },
+      ],
+      hotspotCount: 1,
+    });
+    getHotspotRefreshTask.mockRejectedValueOnce(Object.assign(new Error('timeout of 30000ms exceeded'), {
+      code: 'ECONNABORTED',
+    }));
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /展开热点题材/ }));
+    expect(await screen.findByText('AI算力')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /刷新热点题材/ }));
+
+    expect(await screen.findByText(/将在 2 秒后重试（1\/5）/)).toBeInTheDocument();
+    expect(screen.getByText('AI算力')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /后台刷新中/ })).toBeDisabled();
   });
 
   it('shows input strategy when strategy is not in preset list', async () => {

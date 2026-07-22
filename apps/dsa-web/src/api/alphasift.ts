@@ -183,6 +183,35 @@ export type AlphaSiftHotspotsResponse = {
   details?: Record<string, AlphaSiftHotspotDetail>;
 };
 
+export type AlphaSiftHotspotRefreshResult = {
+  provider?: string;
+  top?: number;
+  hotspotCount: number;
+  cachedAt?: string | null;
+  fallbackUsed?: boolean;
+  sourceErrors?: string[];
+};
+
+export type AlphaSiftHotspotRefreshAccepted = {
+  taskId: string;
+  traceId?: string | null;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  message: string;
+  reused: boolean;
+  provider: string;
+  top: number;
+};
+
+export type AlphaSiftHotspotRefreshTaskStatus = {
+  taskId: string;
+  traceId?: string | null;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  progress?: number | null;
+  message?: string | null;
+  error?: string | null;
+  result?: AlphaSiftHotspotRefreshResult | null;
+};
+
 export type AlphaSiftScreenResponse = {
   enabled: boolean;
   candidates: AlphaSiftCandidate[];
@@ -290,13 +319,33 @@ export const alphasiftApi = {
     return toCamelCase<AlphaSiftStrategiesResponse>(response.data);
   },
 
+  async startHotspotRefresh(
+    payload: { provider?: string; top?: number } = {},
+  ): Promise<AlphaSiftHotspotRefreshAccepted> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/alphasift/hotspots/refresh/tasks',
+      {
+        provider: payload.provider || 'akshare',
+        top: payload.top ?? 12,
+      },
+    );
+    return toCamelCase<AlphaSiftHotspotRefreshAccepted>(response.data);
+  },
+
+  async getHotspotRefreshTask(taskId: string): Promise<AlphaSiftHotspotRefreshTaskStatus> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/alphasift/hotspots/refresh/tasks/${encodeURIComponent(taskId)}`,
+    );
+    return toCamelCase<AlphaSiftHotspotRefreshTaskStatus>(response.data);
+  },
+
   async getHotspots(payload: { provider?: string; top?: number; refresh?: boolean; includeDetails?: boolean } = {}): Promise<AlphaSiftHotspotsResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/alphasift/hotspots', {
       params: {
         provider: payload.provider || 'akshare',
         top: payload.top ?? 12,
         refresh: payload.refresh ?? false,
-        include_details: payload.includeDetails ?? true,
+        include_details: payload.includeDetails ?? false,
       },
       timeout: ALPHASIFT_INSTALL_TIMEOUT_MS,
     });

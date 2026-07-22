@@ -161,7 +161,7 @@ describe('alphasiftApi', () => {
     const result = await alphasiftApi.getHotspots({ provider: 'akshare', top: 12, refresh: true });
 
     expect(get).toHaveBeenCalledWith('/api/v1/alphasift/hotspots', {
-      params: { provider: 'akshare', top: 12, refresh: true, include_details: true },
+      params: { provider: 'akshare', top: 12, refresh: true, include_details: false },
       timeout: 300000,
     });
     expect(result.providerUsed).toBe('akshare');
@@ -220,6 +220,54 @@ describe('alphasiftApi', () => {
     expect(result.stockCount).toBe(1);
     expect(result.stocks[0].name).toBe('戈碧迦');
     expect(result.leaderStocks?.[0].name).toBe('戈碧迦');
+  });
+
+  it('starts a background hotspot refresh task', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        task_id: 'hotspot-refresh-1',
+        trace_id: 'hotspot-refresh-1',
+        status: 'pending',
+        message: '热点题材后台刷新任务已提交',
+        reused: false,
+        provider: 'akshare',
+        top: 12,
+      },
+    });
+
+    const result = await alphasiftApi.startHotspotRefresh({ provider: 'akshare', top: 12 });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/alphasift/hotspots/refresh/tasks',
+      { provider: 'akshare', top: 12 },
+    );
+    expect(result.taskId).toBe('hotspot-refresh-1');
+    expect(result.reused).toBe(false);
+  });
+
+  it('loads background hotspot refresh task status', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        task_id: 'hotspot-refresh-1',
+        trace_id: 'hotspot-refresh-1',
+        status: 'completed',
+        progress: 100,
+        message: '任务执行完成',
+        result: {
+          hotspot_count: 12,
+          cached_at: '2026-07-22T08:55:15Z',
+          fallback_used: false,
+          source_errors: [],
+        },
+      },
+    });
+
+    const result = await alphasiftApi.getHotspotRefreshTask('hotspot-refresh-1');
+
+    expect(get).toHaveBeenCalledWith('/api/v1/alphasift/hotspots/refresh/tasks/hotspot-refresh-1');
+    expect(result.status).toBe('completed');
+    expect(result.result?.hotspotCount).toBe(12);
+    expect(result.result?.cachedAt).toBe('2026-07-22T08:55:15Z');
   });
 
   it('uses a long timeout for LLM-backed screening', async () => {

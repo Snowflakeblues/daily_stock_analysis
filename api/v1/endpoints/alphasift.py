@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -17,6 +18,11 @@ from src.services.task_queue import TaskStatus as QueueTaskStatus
 from src.services.task_queue import get_task_queue
 
 router = APIRouter()
+
+ALPHASIFT_HOTSPOT_REFRESH_REPORT_TYPE = "alphasift_hotspot_refresh"
+ALPHASIFT_HOTSPOT_REFRESH_STOCK_CODE = "alphasift_hotspots"
+_hotspot_refresh_submit_lock = threading.Lock()
+_hotspot_refresh_task_params: Dict[str, Tuple[str, int]] = {}
 
 
 class AlphaSiftScreenRequest(BaseModel):
@@ -57,6 +63,31 @@ class AlphaSiftScreenTaskStatus(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 
+class AlphaSiftHotspotRefreshRequest(BaseModel):
+    provider: str = Field("akshare", max_length=32)
+    top: int = Field(12, ge=1, le=50)
+
+
+class AlphaSiftHotspotRefreshAccepted(BaseModel):
+    task_id: str
+    trace_id: str
+    status: str = "pending"
+    message: str
+    reused: bool = False
+    provider: str
+    top: int
+
+
+class AlphaSiftHotspotRefreshTaskStatus(BaseModel):
+    task_id: str
+    trace_id: Optional[str] = None
+    status: str
+    progress: int = 0
+    message: Optional[str] = None
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+
 def _service(config: Config) -> AlphaSiftService:
     return AlphaSiftService(config=config)
 
@@ -67,6 +98,25 @@ def _screening_task_not_found(task_id: str) -> HTTPException:
         "alphasift_screen_task_not_found",
         f"选股任务 {task_id} 不存在或已过期",
     )
+
+
+def _hotspot_refresh_task_not_found(task_id: str) -> HTTPException:
+    return api_error(
+        404,
+        "alphasift_hotspot_refresh_task_not_found",
+        f"热点题材刷新任务 {task_id} 不存在或已过期",
+    )
+
+
+def _task_status_value(task: Any) -> str:
+    return task.status.value if isinstance(task.status, QueueTaskStatus) else str(task.status)
+
+
+def _find_active_hotspot_refresh_task(task_queue: Any) -> Optional[Any]:
+    for task in task_queue.list_pending_tasks():
+        if task.report_type == ALPHASIFT_HOTSPOT_REFRESH_REPORT_TYPE:
+            return task
+    return None
 
 
 @router.get("/status")
@@ -101,6 +151,128 @@ def alphasift_hotspots(
         top=top,
         refresh=refresh_value,
         include_details=include_details_value,
+    )
+
+
+@router.post(
+    "/hotspots/refresh/tasks",
+    status_code=202,
+    response_model=AlphaSiftHotspotRefreshAccepted,
+)
+def alphasift_start_hotspot_refresh_task(
+    request: AlphaSiftHotspotRefreshRequest,
+    config: Config = Depends(get_config_dep),
+) -> AlphaSiftHotspotRefreshAccepted:
+    provider = request.provider.strip() or "akshare"
+    task_queue = get_task_queue()
+
+    with _hotspot_refresh_submit_lock:
+        active_task = _find_active_hotspot_refresh_task(task_queue)
+        if active_task is not None:
+            active_provider, active_top = _hotspot_refresh_task_params.get(
+                active_task.task_id,
+                (provider, request.top),
+            )
+            return AlphaSiftHotspotRefreshAccepted(
+                task_id=active_task.task_id,
+                trace_id=active_task.trace_id or active_task.task_id,
+                status=_task_status_value(active_task),
+                message=active_task.message or "热点题材后台刷新任务正在运行",
+                reused=True,
+                provider=active_provider,
+                top=active_top,
+            )
+
+        _hotspot_refresh_task_params.clear()
+        task_id = uuid.uuid4().hex
+        _hotspot_refresh_task_params[task_id] = (provider, request.top)
+
+        def run_hotspot_refresh() -> Dict[str, Any]:
+            task_queue.update_task_progress(
+                task_id,
+                10,
+                "正在后台刷新热点题材，当前页面继续使用最近一次有效缓存",
+            )
+            service = _service(config)
+            live_result = service.hotspots(
+                provider=provider,
+                top=request.top,
+                refresh=True,
+                include_details=False,
+            )
+            if not isinstance(live_result, dict) or live_result.get("enabled") is False:
+                message = live_result.get("message") if isinstance(live_result, dict) else None
+                raise RuntimeError(message or "AlphaSift 热点题材刷新未返回有效结果")
+
+            task_queue.update_task_progress(
+                task_id,
+                90,
+                "热点题材已刷新，正在确认最新缓存",
+            )
+            cached_result = service.hotspots(
+                provider=provider,
+                top=request.top,
+                refresh=False,
+                include_details=False,
+            )
+            source_errors = live_result.get("source_errors")
+            return {
+                "provider": cached_result.get("provider_used") or live_result.get("provider_used") or provider,
+                "top": request.top,
+                "hotspot_count": cached_result.get("hotspot_count", live_result.get("hotspot_count", 0)),
+                "cached_at": cached_result.get("cached_at") or live_result.get("cached_at"),
+                "fallback_used": bool(live_result.get("fallback_used")),
+                "source_errors": source_errors if isinstance(source_errors, list) else [],
+            }
+
+        try:
+            task = task_queue.submit_background_task(
+                run_hotspot_refresh,
+                stock_code=ALPHASIFT_HOTSPOT_REFRESH_STOCK_CODE,
+                stock_name="AlphaSift 热点题材",
+                report_type=ALPHASIFT_HOTSPOT_REFRESH_REPORT_TYPE,
+                message="热点题材后台刷新任务已提交",
+                task_id=task_id,
+                trace_id=task_id,
+            )
+        except Exception:
+            _hotspot_refresh_task_params.pop(task_id, None)
+            raise
+
+    return AlphaSiftHotspotRefreshAccepted(
+        task_id=task.task_id,
+        trace_id=task.trace_id or task.task_id,
+        status=_task_status_value(task),
+        message=task.message or "热点题材后台刷新任务已提交",
+        reused=False,
+        provider=provider,
+        top=request.top,
+    )
+
+
+@router.get(
+    "/hotspots/refresh/tasks/{task_id}",
+    response_model=AlphaSiftHotspotRefreshTaskStatus,
+)
+def alphasift_hotspot_refresh_task_status(task_id: str) -> AlphaSiftHotspotRefreshTaskStatus:
+    task = get_task_queue().get_task(task_id)
+    if task is None or task.report_type != ALPHASIFT_HOTSPOT_REFRESH_REPORT_TYPE:
+        raise _hotspot_refresh_task_not_found(task_id)
+
+    result = task.result if task.status == QueueTaskStatus.COMPLETED and isinstance(task.result, dict) else None
+    task_status = _task_status_value(task)
+    if task_status not in {QueueTaskStatus.PENDING.value, QueueTaskStatus.PROCESSING.value}:
+        with _hotspot_refresh_submit_lock:
+            _hotspot_refresh_task_params.pop(task.task_id, None)
+
+    return AlphaSiftHotspotRefreshTaskStatus(
+        task_id=task.task_id,
+        trace_id=task.trace_id or task.task_id,
+        status=task_status,
+        progress=task.progress,
+        message=task.message,
+        error=task.error,
+        result=result,
     )
 
 

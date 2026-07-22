@@ -32,6 +32,7 @@ import {
   type AlphaSiftCandidate,
   type AlphaSiftHotspotDetail,
   type AlphaSiftHotspot,
+  type AlphaSiftHotspotRefreshTaskStatus,
   type AlphaSiftHotspotsResponse,
   type AlphaSiftScreenResponse,
   type AlphaSiftScreenTaskStatus,
@@ -43,6 +44,9 @@ import { AppPage, Button, InlineAlert } from '../components/common';
 const MARKETS = [{ id: 'cn', label: 'A 股' }];
 const SCREEN_TASK_STORAGE_KEY = 'dsa.alphasift.activeScreenTask.v1';
 const SCREEN_TASK_POLL_INTERVAL_MS = 2000;
+const HOTSPOT_REFRESH_POLL_INTERVAL_MS = 2000;
+const HOTSPOT_REFRESH_MAX_POLL_INTERVAL_MS = 30000;
+const HOTSPOT_REFRESH_MAX_CONSECUTIVE_POLL_ERRORS = 5;
 
 type PersistedScreenTask = {
   taskId: string;
@@ -465,6 +469,8 @@ const StockScreeningPage: React.FC = () => {
   const [hotspotDetailError, setHotspotDetailError] = useState('');
   const [loadingHotspots, setLoadingHotspots] = useState(false);
   const [hotspotError, setHotspotError] = useState('');
+  const [activeHotspotRefreshTaskId, setActiveHotspotRefreshTaskId] = useState<string | null>(null);
+  const [hotspotRefreshMessage, setHotspotRefreshMessage] = useState('');
   const [screenMeta, setScreenMeta] = useState<AlphaSiftScreenResponse | null>(null);
   const [expandedCode, setExpandedCode] = useState<string | null>(null);
   const [loading, setLoading] = useState(Boolean(restoredTask?.taskId));
@@ -601,6 +607,28 @@ const StockScreeningPage: React.FC = () => {
     }
   }, [loadHotspotDetail]);
 
+  const handleHotspotRefresh = useCallback(async () => {
+    if (activeHotspotRefreshTaskId) {
+      return;
+    }
+    setLoadingHotspots(true);
+    setHotspotError('');
+    setHotspotRefreshMessage('正在提交热点题材后台刷新任务...');
+    try {
+      const task = await alphasiftApi.startHotspotRefresh({ provider: 'akshare', top: 12 });
+      setActiveHotspotRefreshTaskId(task.taskId);
+      setHotspotRefreshMessage(
+        task.reused
+          ? '检测到已有热点题材刷新任务，正在等待它完成...'
+          : '热点题材已转入后台刷新，当前列表继续使用最近一次有效缓存。',
+      );
+    } catch (err) {
+      setLoadingHotspots(false);
+      setHotspotRefreshMessage('');
+      setHotspotError(toApiErrorMessage(err, '热点题材后台刷新任务提交失败，请稍后重试。'));
+    }
+  }, [activeHotspotRefreshTaskId]);
+
   const handleHotspotSelect = useCallback((topic: string) => {
     selectedHotspotTopicRef.current = topic;
     setSelectedHotspotTopic(topic);
@@ -679,6 +707,120 @@ const StockScreeningPage: React.FC = () => {
       active = false;
     };
   }, [loadHotspots, loadStrategies]);
+
+  useEffect(() => {
+    if (!activeHotspotRefreshTaskId) {
+      return undefined;
+    }
+
+    const pollingTaskId = activeHotspotRefreshTaskId;
+    let active = true;
+    let timer: ReturnType<typeof window.setTimeout> | undefined;
+    let consecutivePollErrors = 0;
+
+    function finishTask() {
+      setActiveHotspotRefreshTaskId(null);
+      setLoadingHotspots(false);
+    }
+
+    function scheduleNextPoll(delayMs = HOTSPOT_REFRESH_POLL_INTERVAL_MS) {
+      timer = window.setTimeout(pollTask, delayMs);
+    }
+
+    async function applyTaskStatus(task: AlphaSiftHotspotRefreshTaskStatus) {
+      if (task.status === 'completed') {
+        await loadHotspots(false);
+        if (!active) {
+          return;
+        }
+        if (task.result?.fallbackUsed) {
+          const sourceError = task.result.sourceErrors?.[0];
+          setHotspotRefreshMessage('热点题材后台刷新完成，但数据源发生降级，已保留最近一次有效缓存。');
+          if (sourceError) {
+            setHotspotError(`热点题材刷新降级：${summarizeAlphaSiftDiagnostic(sourceError)}`);
+          }
+        } else {
+          setHotspotRefreshMessage('热点题材后台刷新完成，已载入最新缓存。');
+        }
+        finishTask();
+        return;
+      }
+
+      if (task.status === 'failed') {
+        setHotspotRefreshMessage('');
+        setHotspotError(`热点题材后台刷新失败：${summarizeAlphaSiftDiagnostic(task.error || task.message || '')}`);
+        finishTask();
+        return;
+      }
+
+      if (isRunningScreenTask(task.status)) {
+        const progress = Number(task.progress ?? 0);
+        const progressText = Number.isFinite(progress) && progress > 0 ? `（${Math.round(progress)}%）` : '';
+        setHotspotRefreshMessage(`${task.message || '热点题材正在后台刷新'}${progressText}`);
+        scheduleNextPoll();
+        return;
+      }
+
+      setHotspotRefreshMessage('');
+      setHotspotError(`热点题材刷新任务返回未知状态：${task.status || 'unknown'}`);
+      finishTask();
+    }
+
+    async function pollTask() {
+      try {
+        const task = await alphasiftApi.getHotspotRefreshTask(pollingTaskId);
+        if (!active) {
+          return;
+        }
+        consecutivePollErrors = 0;
+        await applyTaskStatus(task);
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        const parsedError = getParsedApiError(err);
+        if (parsedError.status === 404) {
+          await loadHotspots(false);
+          if (!active) {
+            return;
+          }
+          setHotspotRefreshMessage('');
+          setHotspotError('热点题材刷新任务状态已失效，已重新读取最近一次有效缓存。');
+          finishTask();
+          return;
+        }
+        consecutivePollErrors += 1;
+        if (consecutivePollErrors >= HOTSPOT_REFRESH_MAX_CONSECUTIVE_POLL_ERRORS) {
+          await loadHotspots(false);
+          if (!active) {
+            return;
+          }
+          setHotspotRefreshMessage('');
+          setHotspotError('热点题材刷新任务状态连续查询失败，已停止自动轮询并保留最近一次有效缓存。');
+          finishTask();
+          return;
+        }
+        const retryDelay = Math.min(
+          HOTSPOT_REFRESH_POLL_INTERVAL_MS * (2 ** (consecutivePollErrors - 1)),
+          HOTSPOT_REFRESH_MAX_POLL_INTERVAL_MS,
+        );
+        setHotspotRefreshMessage(
+          `热点题材仍在后台刷新，状态查询暂时失败，将在 ${Math.round(retryDelay / 1000)} 秒后重试`
+          + `（${consecutivePollErrors}/${HOTSPOT_REFRESH_MAX_CONSECUTIVE_POLL_ERRORS}）。`,
+        );
+        scheduleNextPoll(retryDelay);
+      }
+    }
+
+    void pollTask();
+
+    return () => {
+      active = false;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [activeHotspotRefreshTaskId, loadHotspots]);
 
   useEffect(() => {
     if (!activeTaskId) {
@@ -921,9 +1063,9 @@ const StockScreeningPage: React.FC = () => {
                 size="sm"
                 variant="secondary"
                 isLoading={loadingHotspots}
-                loadingText="刷新中..."
-                disabled={!isScreeningEnabled || loadingHotspots}
-                onClick={() => void loadHotspots(true)}
+                loadingText={activeHotspotRefreshTaskId ? '后台刷新中...' : '读取中...'}
+                disabled={!isScreeningEnabled || loadingHotspots || Boolean(activeHotspotRefreshTaskId)}
+                onClick={() => void handleHotspotRefresh()}
               >
                 <RefreshCw className="h-4 w-4" />
                 刷新热点题材
@@ -933,6 +1075,12 @@ const StockScreeningPage: React.FC = () => {
             <p className="text-xs text-secondary-text">更新时间：{formatHotspotUpdatedAt(hotspotsUpdatedAt)}</p>
           </div>
         </div>
+
+        {hotspotRefreshMessage ? (
+          <p role="status" className="mb-3 rounded-xl border border-cyan/30 bg-cyan/10 px-3 py-2 text-xs text-cyan">
+            {hotspotRefreshMessage}
+          </p>
+        ) : null}
 
         {hotspotError ? (
           <p className="mb-3 rounded-xl border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 import threading
 
 from fastapi import FastAPI, HTTPException
@@ -332,6 +332,182 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertTrue(hasattr(provider, "stock_board_concept_name_em"))
         self.assertTrue(hasattr(provider, "stock_board_industry_name_em"))
         self.assertEqual(discover.call_args.kwargs["top"], 1)
+
+    def test_hotspot_refresh_task_submits_live_refresh_without_detail_prefetch(self) -> None:
+        config = self._config(enabled=True)
+        task_queue = MagicMock()
+        task_queue.list_pending_tasks.return_value = []
+        submitted: Dict[str, Any] = {}
+
+        def submit_background_task(run_task, **kwargs):
+            submitted["run_task"] = run_task
+            submitted["kwargs"] = kwargs
+            return TaskInfo(
+                task_id=kwargs["task_id"],
+                trace_id=kwargs["trace_id"],
+                stock_code=kwargs["stock_code"],
+                stock_name=kwargs["stock_name"],
+                status=QueueTaskStatus.PENDING,
+                message=kwargs["message"],
+                report_type=kwargs["report_type"],
+            )
+
+        task_queue.submit_background_task.side_effect = submit_background_task
+        service = MagicMock()
+        service.hotspots.side_effect = [
+            {
+                "hotspot_count": 12,
+                "cached_at": None,
+                "fallback_used": False,
+                "source_errors": [],
+            },
+            {
+                "hotspot_count": 12,
+                "cached_at": "2026-07-22T08:55:15Z",
+                "cache_used": True,
+            },
+        ]
+
+        with (
+            patch.object(alphasift_endpoint, "get_task_queue", return_value=task_queue),
+            patch.object(alphasift_endpoint, "_service", return_value=service),
+        ):
+            accepted = alphasift_endpoint.alphasift_start_hotspot_refresh_task(
+                alphasift_endpoint.AlphaSiftHotspotRefreshRequest(provider="akshare", top=12),
+                config=config,
+            )
+            result = submitted["run_task"]()
+
+        self.assertFalse(accepted.reused)
+        self.assertEqual(accepted.status, "pending")
+        self.assertEqual(accepted.provider, "akshare")
+        self.assertEqual(accepted.top, 12)
+        self.assertEqual(submitted["kwargs"]["report_type"], "alphasift_hotspot_refresh")
+        service.hotspots.assert_has_calls([
+            call(provider="akshare", top=12, refresh=True, include_details=False),
+            call(provider="akshare", top=12, refresh=False, include_details=False),
+        ])
+        self.assertEqual(result["hotspot_count"], 12)
+        self.assertEqual(result["cached_at"], "2026-07-22T08:55:15Z")
+        self.assertFalse(result["fallback_used"])
+
+    def test_hotspot_refresh_task_surfaces_live_refresh_failure(self) -> None:
+        config = self._config(enabled=True)
+        task_queue = MagicMock()
+        task_queue.list_pending_tasks.return_value = []
+        submitted: Dict[str, Any] = {}
+
+        def submit_background_task(run_task, **kwargs):
+            submitted["run_task"] = run_task
+            return TaskInfo(
+                task_id=kwargs["task_id"],
+                trace_id=kwargs["trace_id"],
+                stock_code=kwargs["stock_code"],
+                stock_name=kwargs["stock_name"],
+                status=QueueTaskStatus.PENDING,
+                message=kwargs["message"],
+                report_type=kwargs["report_type"],
+            )
+
+        task_queue.submit_background_task.side_effect = submit_background_task
+        service = MagicMock()
+        service.hotspots.side_effect = RuntimeError("upstream timeout")
+
+        with (
+            patch.object(alphasift_endpoint, "get_task_queue", return_value=task_queue),
+            patch.object(alphasift_endpoint, "_service", return_value=service),
+        ):
+            accepted = alphasift_endpoint.alphasift_start_hotspot_refresh_task(
+                alphasift_endpoint.AlphaSiftHotspotRefreshRequest(provider="akshare", top=12),
+                config=config,
+            )
+            with self.assertRaisesRegex(RuntimeError, "upstream timeout"):
+                submitted["run_task"]()
+
+        self.assertEqual(accepted.status, "pending")
+        service.hotspots.assert_called_once_with(
+            provider="akshare",
+            top=12,
+            refresh=True,
+            include_details=False,
+        )
+        task_queue.update_task_progress.assert_called_once_with(
+            accepted.task_id,
+            10,
+            "正在后台刷新热点题材，当前页面继续使用最近一次有效缓存",
+        )
+
+    def test_hotspot_refresh_task_reuses_existing_inflight_task(self) -> None:
+        config = self._config(enabled=True)
+        existing = TaskInfo(
+            task_id="hotspot-refresh-existing",
+            trace_id="hotspot-refresh-existing",
+            stock_code="alphasift_hotspots",
+            status=QueueTaskStatus.PROCESSING,
+            progress=35,
+            message="任务执行中",
+            report_type="alphasift_hotspot_refresh",
+        )
+        task_queue = MagicMock()
+        task_queue.list_pending_tasks.return_value = [existing]
+
+        with (
+            patch.object(alphasift_endpoint, "get_task_queue", return_value=task_queue),
+            patch.dict(
+                alphasift_endpoint._hotspot_refresh_task_params,
+                {"hotspot-refresh-existing": ("akshare", 12)},
+                clear=True,
+            ),
+        ):
+            accepted = alphasift_endpoint.alphasift_start_hotspot_refresh_task(
+                alphasift_endpoint.AlphaSiftHotspotRefreshRequest(provider="custom", top=50),
+                config=config,
+            )
+
+        self.assertTrue(accepted.reused)
+        self.assertEqual(accepted.task_id, "hotspot-refresh-existing")
+        self.assertEqual(accepted.status, "processing")
+        self.assertEqual(accepted.provider, "akshare")
+        self.assertEqual(accepted.top, 12)
+        task_queue.submit_background_task.assert_not_called()
+
+    def test_hotspot_refresh_task_status_returns_compact_result(self) -> None:
+        task_queue = MagicMock()
+        task_queue.get_task.return_value = TaskInfo(
+            task_id="hotspot-refresh-completed",
+            trace_id="hotspot-refresh-completed",
+            stock_code="alphasift_hotspots",
+            status=QueueTaskStatus.COMPLETED,
+            progress=100,
+            message="任务执行完成",
+            result={
+                "hotspot_count": 12,
+                "cached_at": "2026-07-22T08:55:15Z",
+                "fallback_used": False,
+                "source_errors": [],
+            },
+            report_type="alphasift_hotspot_refresh",
+        )
+
+        with patch.object(alphasift_endpoint, "get_task_queue", return_value=task_queue):
+            status = alphasift_endpoint.alphasift_hotspot_refresh_task_status("hotspot-refresh-completed")
+
+        self.assertEqual(status.status, "completed")
+        self.assertEqual(status.result["hotspot_count"], 12)
+        self.assertEqual(status.result["cached_at"], "2026-07-22T08:55:15Z")
+
+    def test_hotspot_refresh_task_status_rejects_unknown_task(self) -> None:
+        task_queue = MagicMock()
+        task_queue.get_task.return_value = None
+
+        with (
+            patch.object(alphasift_endpoint, "get_task_queue", return_value=task_queue),
+            self.assertRaises(HTTPException) as captured,
+        ):
+            alphasift_endpoint.alphasift_hotspot_refresh_task_status("missing-hotspot-refresh")
+
+        self.assertEqual(captured.exception.status_code, 404)
+        self.assertEqual(captured.exception.detail["error"], "alphasift_hotspot_refresh_task_not_found")
 
     def test_hotspots_default_provider_uses_dsa_eastmoney_provider(self) -> None:
         provider_name, provider = alphasift_service._resolve_hotspot_provider("")
