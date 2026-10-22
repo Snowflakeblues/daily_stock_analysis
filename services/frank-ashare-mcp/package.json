@@ -1,0 +1,14 @@
+{
+  "name": "frank-ashare-mcp-cloud",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Streamable HTTP MCP bridge for private A-share valuation",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  }
+}
