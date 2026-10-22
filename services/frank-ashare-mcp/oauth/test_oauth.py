@@ -65,6 +65,32 @@ class DataChecks(unittest.TestCase):
         self.assertNotIn("do-not-disclose", result.content[0].text)
 
 
+class SecretFileChecks(unittest.TestCase):
+    def test_render_secret_file_is_supported_without_disclosure(self):
+        for name in ("GITHUB_OAUTH_CLIENT_SECRET", "ASHARE_ASSET_API_KEY"):
+            with patch.dict(os.environ, {name: ""}):
+                with patch.object(server.Path, "read_text", return_value="offline-file-secret\n") as read:
+                    self.assertEqual(server.required_secret(name), "offline-file-secret")
+                    read.assert_called_once_with(encoding="utf-8")
+
+    def test_environment_variable_takes_precedence(self):
+        with patch.dict(os.environ, {"GITHUB_OAUTH_CLIENT_SECRET": "offline-env-secret"}):
+            with patch.object(server.Path, "read_text") as read:
+                self.assertEqual(server.required_secret("GITHUB_OAUTH_CLIENT_SECRET"), "offline-env-secret")
+                read.assert_not_called()
+
+    def test_missing_invalid_and_unreadable_files_fail_closed(self):
+        with patch.dict(os.environ, {"GITHUB_OAUTH_CLIENT_SECRET": ""}):
+            for failure in (FileNotFoundError(), PermissionError("private-detail"), UnicodeError("private-detail")):
+                with patch.object(server.Path, "read_text", side_effect=failure):
+                    with self.assertRaises(RuntimeError) as error:
+                        server.required_secret("GITHUB_OAUTH_CLIENT_SECRET")
+                    self.assertNotIn("private-detail", str(error.exception))
+            with patch.object(server.Path, "read_text", return_value="invalid secret"):
+                with self.assertRaises(RuntimeError):
+                    server.required_secret("GITHUB_OAUTH_CLIENT_SECRET")
+
+
 class HTTPChecks(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, ENV)

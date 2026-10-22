@@ -29,6 +29,14 @@ CLIENT_REDIRECTS = [
 
 def required_secret(name: str, minimum: int = 1) -> str:
     value = os.environ.get(name, "").strip()
+    # Render also mounts dashboard Secret Files here; never log their contents.
+    if not value and name in {"GITHUB_OAUTH_CLIENT_SECRET", "ASHARE_ASSET_API_KEY"}:
+        try:
+            value = (Path("/etc/secrets") / name).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            raise RuntimeError(f"Unable to read the configured {name} secret file.") from None
     if len(value) < minimum or not value.isascii() or any(c.isspace() for c in value):
         raise RuntimeError(f"Configure {name} securely (minimum {minimum} ASCII characters, no whitespace).")
     return value
@@ -129,7 +137,7 @@ def create_mcp(*, storage=None):
     )
 
     @mcp.tool(
-        name="get_ashare_valuation", title="读取 A 股收盘估值",
+        name="get_ashare_valuation", title="��ȡ A �����̹�ֵ",
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
         meta={"securitySchemes": [{"type": "oauth2", "scopes": SCOPES}]},
     )
@@ -145,10 +153,10 @@ def create_mcp(*, storage=None):
     async def homepage(request):
         return HTMLResponse(
             '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-            '<title>Frank A股估值</title><main style="max-width:640px;margin:60px auto;padding:20px;font:18px/1.8 sans-serif">'
-            '<h1>Frank A股估值</h1><p>私人只读收盘估值服务。</p>'
-            '<p>请从 ChatGPT 插件的连接入口发起 GitHub 登录授权。服务只允许已配置的持有人账号读取估值。</p>'
-            '<p>资产接口密钥由服务器安全配置，本页不接收密钥。</p></main></html>',
+            '<title>Frank A�ɹ�ֵ</title><main style="max-width:640px;margin:60px auto;padding:20px;font:18px/1.8 sans-serif">'
+            '<h1>Frank A�ɹ�ֵ</h1><p>˽��ֻ�����̹�ֵ����</p>'
+            '<p>��� ChatGPT �����������ڷ��� GitHub ��¼��Ȩ������ֻ���������õĳ������˺Ŷ�ȡ��ֵ��</p>'
+            '<p>�ʲ��ӿ���Կ�ɷ�������ȫ���ã���ҳ��������Կ��</p></main></html>',
             headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff"},
         )
     return mcp
