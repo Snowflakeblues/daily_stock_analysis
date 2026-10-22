@@ -162,8 +162,30 @@ class HTTPChecks(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_OAUTH_CLIENT_SECRET": ENV["ASHARE_ASSET_API_KEY"]}), self.assertRaises(RuntimeError):
             server.create_app(storage=MemoryStore())
 
-    def authorize_offline(self):
-        redirect = server.CLIENT_REDIRECTS[0]
+    def test_desktop_loopback_registration(self):
+        for redirect in ("http://127.0.0.1:49173/callback", "http://127.0.0.1:49174/callback/client-id"):
+            response = self.register_client(redirect)
+            self.assertEqual(response.status_code, 201, response.text)
+
+    def test_desktop_allowlist_rejects_lookalike_hosts_and_path_escape(self):
+        for redirect in (
+            "http://127.0.0.1.attacker.invalid:49173/callback",
+            "http://127.0.0.1:49173@attacker.invalid/callback",
+            "http://192.0.2.1:49173/callback",
+            "http://127.0.0.1:49173/other",
+            "http://127.0.0.1:49173/callback/%2e%2e/steal",
+        ):
+            response = self.register_client(redirect)
+            self.assertGreaterEqual(response.status_code, 400, redirect)
+
+    def test_desktop_callback_and_pkce_exchange_offline(self):
+        grant = self.authorize_offline("http://127.0.0.1:49173/callback")
+        tokens = self.client.post("/token", data=grant)
+        self.assertEqual(tokens.status_code, 200, tokens.text)
+        self.assertIn("access_token", tokens.json())
+
+    def authorize_offline(self, redirect=None):
+        redirect = redirect or server.CLIENT_REDIRECTS[0]
         registered = self.register_client(redirect).json()
         verifier = "p" * 43
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()

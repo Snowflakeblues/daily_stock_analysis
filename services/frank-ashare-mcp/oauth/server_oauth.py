@@ -24,6 +24,10 @@ SCOPES = ["read:user"]
 CLIENT_REDIRECTS = [
     "https://chatgpt.com/connector_platform_oauth_redirect",
     "https://chatgpt.com/connector/oauth/*",
+    # Codex desktop receives its authorization code on an ephemeral loopback port.
+    # FastMCP validates URL components, registered paths and PKCE separately.
+    "http://127.0.0.1:*/callback",
+    "http://127.0.0.1:*/callback/*",
 ]
 
 
@@ -131,7 +135,7 @@ def create_mcp(*, storage=None):
         enable_cimd=True,
     )
     mcp = FastMCP(
-        "Frank A-share valuation", version="0.3.0", auth=auth,
+        "Frank A-share valuation", version="0.3.1", auth=auth,
         instructions="Read-only configured A-share closing snapshots. Preserve all source fields and decimal strings. Verify valuation_date, freshness, usable_for_current_report, holdings and coverage before reporting current values.",
         mask_error_details=True, strict_input_validation=True,
     )
