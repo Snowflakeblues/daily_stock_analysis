@@ -11,9 +11,9 @@ createServer(async(req,res)=>{
   if(req.method!=='POST')return send(res,405,{error:'POST required'});
   const origin=req.headers.origin;
   if(origin&&!['https://chatgpt.com','https://chat.openai.com'].includes(origin))return send(res,403,{error:'forbidden origin'});
-  const m=/^Bearer ([^\\s]+)$/i.exec(req.headers.authorization||'');
+  const auth=req.headers.authorization||'';const m=auth.startsWith('Bearer ')&&auth.slice(7).length&&!auth.slice(7).includes(' ')?[auth,auth.slice(7)]:null;
   if(!m)return send(res,401,{error:'Bearer API Key required'});
-  if(!/^application\\/json/i.test(req.headers['content-type']||''))return send(res,415,{error:'JSON required'});
+  if(!(req.headers['content-type']||'').toLowerCase().startsWith('application/json'))return send(res,415,{error:'JSON required'});
   let raw='';for await(const chunk of req){raw+=chunk.toString();if(raw.length>65536)return send(res,413,{error:'request too large'})}
   let rpc;try{rpc=JSON.parse(raw)}catch{return send(res,400,{error:'invalid JSON'})}
   if(!rpc||typeof rpc!=='object'||Array.isArray(rpc)||rpc.jsonrpc!=='2.0')return send(res,400,{error:'invalid JSON-RPC'});
