@@ -204,7 +204,7 @@ class HTTPChecks(unittest.TestCase):
         upstream_params = parse_qs(upstream_url.query)
         self.assertEqual(upstream_params["scope"], ["read:user"])
         self.assertNotIn("repo", upstream_params["scope"][0])
-        fake_tokens = {"access_token": "offline-upstream-token", "token_type": "Bearer", "scope": "read:user", "expires_in": 3600}
+        fake_tokens = getattr(self, "upstream_tokens", {"access_token": "offline-upstream-token", "token_type": "Bearer", "scope": "read:user"})
         with patch("fastmcp.server.auth.oauth_proxy.upstream.AsyncOAuth2Client.fetch_token", new=AsyncMock(return_value=fake_tokens)):
             callback = self.client.get("/auth/callback?" + urlencode({"code": "offline-github-code", "state": upstream_params["state"][0]}), follow_redirects=False)
         self.assertEqual(callback.status_code, 302, callback.text)

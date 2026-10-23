@@ -17,6 +17,7 @@ from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.responses import HTMLResponse, JSONResponse
 
 from provider import SnapshotError, fetch_snapshot
+from remote_store import RemoteOAuthStore
 
 BASE_URL = "https://frank-ashare-mcp.onrender.com"
 OWNER_GITHUB_ID = "235202824"  # Verified public ID of Snowflakeblues; names can change.
@@ -88,6 +89,19 @@ class NoStoreMiddleware:
         await self.app(scope, receive, add_headers if scope["type"] == "http" else send)
 
 
+def local_storage():
+    state_directory = os.environ.get("OAUTH_STATE_DIR", "").strip()
+    if not state_directory:
+        raise RuntimeError("Set OAUTH_STATE_DIR to a private server-side state directory.")
+    state_path = Path(state_directory)
+    state_path.mkdir(parents=True, exist_ok=True)
+    try:
+        state_path.chmod(0o700)
+    except OSError:
+        raise RuntimeError("Unable to protect the OAuth state directory.") from None
+    return FileTreeStore(data_directory=state_path)
+
+
 def create_mcp(*, storage=None):
     client_id = required_secret("GITHUB_OAUTH_CLIENT_ID")
     client_secret = required_secret("GITHUB_OAUTH_CLIENT_SECRET")
@@ -97,16 +111,10 @@ def create_mcp(*, storage=None):
         raise RuntimeError("Use distinct OAuth, provider, and signing credentials.")
 
     if storage is None:
-        state_directory = os.environ.get("OAUTH_STATE_DIR", "").strip()
-        if not state_directory:
-            raise RuntimeError("Set OAUTH_STATE_DIR to a private server-side state directory.")
-        state_path = Path(state_directory)
-        state_path.mkdir(parents=True, exist_ok=True)
-        try:
-            state_path.chmod(0o700)
-        except OSError:
-            raise RuntimeError("Unable to protect the OAuth state directory.") from None
-        storage = FileTreeStore(data_directory=state_path)
+        if os.environ.get("RENDER") or os.environ.get("OAUTH_STATE_BACKEND") == "remote":
+            storage = RemoteOAuthStore(required_secret("OAUTH_STATE_API_KEY", minimum=32))
+        else:
+            storage = local_storage()
     encrypted_storage = FernetEncryptionWrapper(
         key_value=storage,
         fernet=Fernet(base64.urlsafe_b64encode(hashlib.sha256(signing_key + b"/oauth-state/v1").digest())),
@@ -130,18 +138,21 @@ def create_mcp(*, storage=None):
         jwt_signing_key=signing_key,
         client_storage=encrypted_storage,
         require_authorization_consent=True,
-        fastmcp_access_token_expiry_seconds=900,
+        # GitHub OAuth Apps normally return a revocable, non-refreshable token.
+        # A 15-minute downstream lifetime would force a browser login every time.
+        # The GitHub verifier still checks the owner and upstream validity on use.
+        fastmcp_access_token_expiry_seconds=7 * 86400,
         fallback_refresh_token_expiry_seconds=86400,
         enable_cimd=True,
     )
     mcp = FastMCP(
-        "Frank A-share valuation", version="0.3.1", auth=auth,
+        "Frank A-share valuation", version="0.3.2", auth=auth,
         instructions="Read-only configured A-share closing snapshots. Preserve all source fields and decimal strings. Verify valuation_date, freshness, usable_for_current_report, holdings and coverage before reporting current values.",
         mask_error_details=True, strict_input_validation=True,
     )
 
     @mcp.tool(
-        name="get_ashare_valuation", title="��ȡ A �����̹�ֵ",
+        name="get_ashare_valuation", title="读取 A 股收盘估值",
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
         meta={"securitySchemes": [{"type": "oauth2", "scopes": SCOPES}]},
     )
@@ -151,16 +162,22 @@ def create_mcp(*, storage=None):
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request):
-        return JSONResponse({"status": "ok", "service": "frank-ashare-mcp", "auth": "oauth"})
+        if isinstance(storage, RemoteOAuthStore):
+            try:
+                await storage.check()
+            except Exception:
+                return JSONResponse({"status": "unavailable"}, status_code=503)
+        return JSONResponse({"status": "ok", "service": "frank-ashare-mcp", "auth": "oauth",
+                             "version": "0.3.2", "oauth_storage": "persistent-remote" if isinstance(storage, RemoteOAuthStore) else "local"})
 
     @mcp.custom_route("/", methods=["GET"])
     async def homepage(request):
         return HTMLResponse(
             '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-            '<title>Frank A�ɹ�ֵ</title><main style="max-width:640px;margin:60px auto;padding:20px;font:18px/1.8 sans-serif">'
-            '<h1>Frank A�ɹ�ֵ</h1><p>˽��ֻ�����̹�ֵ����</p>'
-            '<p>��� ChatGPT �����������ڷ��� GitHub ��¼��Ȩ������ֻ���������õĳ������˺Ŷ�ȡ��ֵ��</p>'
-            '<p>�ʲ��ӿ���Կ�ɷ�������ȫ���ã���ҳ��������Կ��</p></main></html>',
+            '<title>Frank A股估值</title><main style="max-width:640px;margin:60px auto;padding:20px;font:18px/1.8 sans-serif">'
+            '<h1>Frank A股估值</h1><p>私人只读收盘估值服务。</p>'
+            '<p>请从 ChatGPT 插件的连接入口发起 GitHub 登录授权。服务只允许已配置的持有人账号读取估值。</p>'
+            '<p>资产接口密钥由服务器安全配置，本页不接收密钥。</p></main></html>',
             headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff"},
         )
     return mcp
